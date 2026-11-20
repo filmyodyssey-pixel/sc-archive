@@ -1,1 +1,188 @@
+name: Archive sc commits
 
+on:
+  schedule:
+    - cron: "*/5 * * * *"    # works alone; optional external dispatch makes it faster
+  workflow_dispatch:
+
+permissions:
+  contents: write            # lets the built-in GITHUB_TOKEN push to THIS repo
+
+concurrency:
+  group: sc-archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SOURCE_URL: https://github.com/unknownman2024/sc.git
+      WATCH_FILES: "daily.py daily9.py"
+      ARCHIVE_BRANCH: archive
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Detect change, mirror, preserve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export GIT_TERMINAL_PROMPT=0
+          ARCHIVE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+          WORK=$(mktemp -d)
+          NEWREFS="$WORK/refs.new"
+
+          retry() {
+            local n=1
+            until "$@"; do
+              [ "$n" -ge 4 ] && return 1
+              sleep $((n * 5)); n=$((n + 1))
+            done
+          }
+          mg() { git --git-dir="$WORK/mirror.git" "$@"; }
+
+          # ---------------------------------------------------------------
+          # 1. CHEAP CHECK: one tiny request, no clone
+          # ---------------------------------------------------------------
+          retry git ls-remote --heads --tags "$SOURCE_URL" > "$WORK/refs.raw"
+          grep -v '\^{}$' "$WORK/refs.raw" | sort -k2 > "$NEWREFS" || true
+
+          if [ ! -s "$NEWREFS" ]; then
+            echo "::warning::Source returned no refs (deleted, private or GitHub error). Archive untouched."
+            exit 0
+          fi
+
+          # ---------------------------------------------------------------
+          # 2. LOAD LAST KNOWN STATE (shallow fetch of the archive branch)
+          # ---------------------------------------------------------------
+          cd "$WORK"
+          git init -q state
+          git -C state config user.name "github-actions[bot]"
+          git -C state config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C state remote add archive "$ARCHIVE_URL"
+
+          rc=0
+          git -C state ls-remote --exit-code --heads archive "$ARCHIVE_BRANCH" >/dev/null 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            retry git -C state fetch -q --depth 1 archive "$ARCHIVE_BRANCH"
+            git -C state checkout -q -B "$ARCHIVE_BRANCH" FETCH_HEAD
+          elif [ "$rc" -eq 2 ]; then
+            echo "First run: creating $ARCHIVE_BRANCH branch."
+            git -C state symbolic-ref HEAD "refs/heads/$ARCHIVE_BRANCH"
+          else
+            echo "::error::Cannot reach this repo with GITHUB_TOKEN (check Settings > Actions > Workflow permissions)."
+            exit 1
+          fi
+
+          if [ -f state/refs.txt ] && cmp -s state/refs.txt "$NEWREFS"; then
+            echo "No change in source refs. Done."
+            exit 0
+          fi
+          echo "Change detected. Archiving..."
+
+          # ---------------------------------------------------------------
+          # 3. MIRROR FETCH (only runs when something changed)
+          # ---------------------------------------------------------------
+          git init -q --bare mirror.git
+          mg remote add origin "$SOURCE_URL"
+          retry mg fetch -q --no-tags --update-head-ok origin \
+            '+refs/heads/*:refs/heads/*' \
+            '+refs/tags/*:refs/tags/*'
+
+          # ---------------------------------------------------------------
+          # 4. CLASSIFY CHANGES
+          #    Old tip still present and an ancestor of the new tip = normal push.
+          #    Otherwise upstream history was rewritten or removed.
+          # ---------------------------------------------------------------
+          EVENTS="$WORK/events.new"; : > "$EVENTS"
+          if [ -f state/refs.txt ]; then
+            while read -r OSHA OREF; do
+              case "$OREF" in refs/heads/*) ;; *) continue ;; esac
+              NSHA=$(awk -v r="$OREF" '$2==r {print $1}' "$NEWREFS")
+              if [ -z "$NSHA" ]; then
+                echo "$NOW BRANCH_DELETED $OREF $OSHA" >> "$EVENTS"
+                echo "::warning::Branch deleted upstream: $OREF"
+                continue
+              fi
+              [ "$OSHA" = "$NSHA" ] && continue
+              if mg cat-file -e "$OSHA^{commit}" 2>/dev/null \
+                 && mg merge-base --is-ancestor "$OSHA" "$NSHA"; then
+                echo "$NOW FAST_FORWARD $OREF $OSHA -> $NSHA" >> "$EVENTS"
+              else
+                echo "$NOW HISTORY_REWRITTEN $OREF $OSHA -> $NSHA" >> "$EVENTS"
+                echo "::warning::History rewritten on $OREF"
+              fi
+            done < state/refs.txt
+          fi
+
+          # ---------------------------------------------------------------
+          # 5. PERMANENT PRESERVATION AS INCREMENTAL GIT BUNDLES
+          #    Bundles are opaque files, so GITHUB_TOKEN can store them even if
+          #    the source repo contains .github/workflows files (a normal branch
+          #    push of those would be rejected). Each bundle holds only commits
+          #    not already archived, so growth is small.
+          # ---------------------------------------------------------------
+          EXCL=()
+          if [ -f state/refs.txt ]; then
+            while read -r OSHA _; do
+              C=$(mg rev-parse -q --verify "$OSHA^{commit}" 2>/dev/null) || continue
+              EXCL+=("$C")
+            done < state/refs.txt
+          fi
+
+          mkdir -p state/bundles
+          BUNDLE="$WORK/state/bundles/$STAMP.bundle"
+          if [ "${#EXCL[@]}" -gt 0 ]; then
+            ARGS=(--all --not "${EXCL[@]}")
+          else
+            ARGS=(--all)
+          fi
+          if ! mg bundle create "$BUNDLE" "${ARGS[@]}" 2> "$WORK/bundle.err"; then
+            if grep -qi 'empty bundle' "$WORK/bundle.err"; then
+              echo "No new commits to bundle."
+            else
+              cat "$WORK/bundle.err"; exit 1
+            fi
+          fi
+
+          # ---------------------------------------------------------------
+          # 6. PLAINTEXT FILE VERSIONS + COMMIT LOG (deduplicated by blob)
+          # ---------------------------------------------------------------
+          cd state
+          mkdir -p plaintext
+          touch plaintext/index.tsv commits.tsv events.log
+
+          declare -A KNOWN
+          while IFS=$'\t' read -r C F B D; do
+            KNOWN["${C}_${F}"]=1
+          done < plaintext/index.tsv
+
+          NEWFILES=0
+          while read -r C; do
+            for F in $WATCH_FILES; do
+              [ -n "${KNOWN[${C}_${F}]:-}" ] && continue
+              B=$(mg rev-parse -q --verify "$C:$F" 2>/dev/null) || continue
+              BLOB="plaintext/${F%.py}-$B.py"
+              [ -f "$BLOB" ] || mg cat-file blob "$B" > "$BLOB"
+              D=$(mg show -s --format=%cI "$C")
+              printf '%s\t%s\t%s\t%s\n' "$C" "$F" "$B" "$D" >> plaintext/index.tsv
+              NEWFILES=$((NEWFILES + 1))
+            done
+          done < <(mg rev-list --all)
+
+          # Union of old and new commit metadata: old lines survive a history reset.
+          { cat commits.tsv; mg log --all --format='%H%x09%P%x09%aI%x09%an%x09%s'; } \
+            | sort -u -t$'\t' -k1,1 -o commits.tsv
+
+          # ---------------------------------------------------------------
+          # 7. SAVE STATE LAST (a failed run is simply retried next time)
+          # ---------------------------------------------------------------
+          cat "$EVENTS" >> events.log
+          cp "$NEWREFS" refs.txt
+          git add -A
+          git commit -q -m "Archive state $NOW"
+          retry git push -q archive "HEAD:refs/heads/$ARCHIVE_BRANCH"
+
+          echo "Archived. New plaintext file versions: $NEWFILES"
